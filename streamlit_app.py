@@ -1,319 +1,299 @@
 # streamlit_app.py
-# 실행: streamlit run --server.port 3000 --server.address 0.0.0.0 streamlit_app.py
+"""
+Streamlit 앱: 공개 데이터 대시보드 + 사용자 입력(프롬프트) 기반 대시보드
+- 공개 데이터: Our World in Data CO2 (OWID) + NASA GISTEMP global temp (GISTEMP)
+- 사용자 입력: 프롬프트 내 제공된 한글 설명(20년 온난화, 폭염일수 증가) + 업로드된 시각화 이미지 사용
+- 코드 주석에 출처(URL) 명시
 
+출처:
+- OWID CO2 데이터 (CSV): https://github.com/owid/co2-data -> raw CSV URL used in code.
+  (원본: https://ourworldindata.org/co2-and-other-greenhouse-gas-emissions)
+  raw CSV: https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv
+- NASA GISTEMP global annual/seasonal temperature: https://data.giss.nasa.gov/gistemp/
+  GISTEMP raw CSV used: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
+- KMA Open MET (참고): https://data.kma.go.kr/
+"""
+
+from __future__ import annotations
 import io
-import datetime
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import streamlit as st
-
-# -----------------------------
-# ✅ 안정적 네트워크 (requests + Retry)
-# -----------------------------
-import socket
+import time
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from typing import Tuple
+import pandas as pd
+import numpy as np
+import streamlit as st
+import matplotlib.pyplot as plt
+import plotly.express as px
+from datetime import datetime
 
-_session = requests.Session()
-_retries = Retry(
-    total=3,
-    backoff_factor=0.6,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET"],
-    raise_on_status=False,
-)
-_session.mount("https://", HTTPAdapter(max_retries=_retries))
-_session.mount("http://", HTTPAdapter(max_retries=_retries))
+st.set_page_config(layout="wide", page_title="기후 대시보드 (공개 데이터 + 사용자 입력)", page_icon="🌍")
 
-# 배포 환경에서 IPv6 문제 회피용 (필요 없으면 False)
-FORCE_IPV4 = True
-if FORCE_IPV4:
-    _orig_getaddrinfo = socket.getaddrinfo
-    def _ipv4_only_getaddrinfo(host, port, *args, **kwargs):
-        res = _orig_getaddrinfo(host, port, *args, **kwargs)
-        v4 = [ai for ai in res if ai[0] == socket.AF_INET]
-        return v4 or res
-    socket.getaddrinfo = _ipv4_only_getaddrinfo
+# --- 폰트 적용 시도 (Pretendard) ---
+try:
+    import matplotlib.font_manager as fm
+    FONT_PATH = "/fonts/Pretendard-Bold.ttf"
+    fm.fontManager.addfont(FONT_PATH)
+    plt.rcParams['font.family'] = fm.FontProperties(fname=FONT_PATH).get_name()
+except Exception:
+    # 폰트가 없거나 추가 실패하면 기본 폰트 사용
+    pass
 
-# -----------------------------
-# ✅ 한국어 폰트 등록
-# -----------------------------
-from matplotlib import font_manager as fm, rcParams
-font_path = Path("fonts/Pretendard-Bold.ttf").resolve()
-if font_path.exists():
-    fm.fontManager.addfont(str(font_path))
-    font_prop = fm.FontProperties(fname=str(font_path))
-    rcParams["font.family"] = font_prop.get_name()
-else:
-    font_prop = fm.FontProperties()
-rcParams["axes.unicode_minus"] = False
-
-# -----------------------------
-# Streamlit 설정
-# -----------------------------
-st.set_page_config(layout="wide", page_title="CO₂ & Global Temperature Dashboard")
-st.title("🌍 대기 중 CO₂ 농도와 지구 평균 기온, 무슨 관계가 있을까?")
-st.caption("데이터 출처: NOAA GML, NASA GISTEMP · 실패 시 data/co2_temp_merged_1960_2024.csv 사용")
-
-# -----------------------------
-# 안전한 fetch 유틸 (requests 기반)
-# -----------------------------
-def fetch_text(url: str, timeout: int = 12) -> list[str]:
-    """urllib 대체. 세션/재시도/백오프/IPv4 우선."""
-    headers = {"User-Agent": "Mozilla/5.0 (Streamlit classroom app)"}
-    resp = _session.get(url, headers=headers, timeout=(6, timeout))
-    resp.raise_for_status()
-    return resp.text.replace("\r\n", "\n").splitlines()
-
-def safe_fetch_lines(url: str, *, fallback_path: Path | None = None, timeout: int = 12) -> list[str] | None:
-    """성공 시 텍스트 라인 반환, 실패 시 fallback_path가 존재하면 None(=로컬 사용 신호) 반환."""
-    try:
-        return fetch_text(url, timeout=timeout)
-    except Exception:
-        if fallback_path and fallback_path.exists():
-            st.warning(f"⚠️ 원격 데이터 호출 실패 → 로컬 CSV 사용 ({fallback_path})")
-            return None
-        raise
-
-# -----------------------------
-# 데이터 로더 (원격 → 실패 시 data CSV)
-# -----------------------------
-@st.cache_data(show_spinner=False)
-def load_datasets() -> pd.DataFrame:
-    co2_url = "https://gml.noaa.gov/webdata/ccgg/trends/co2/co2_mm_mlo.txt"
-    temp_url = "https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"
-    fallback = Path("data/co2_temp_merged_1960_2024.csv")
-
-    # 1) CO₂
-    lines = safe_fetch_lines(co2_url, fallback_path=fallback)
-    if lines is None:
-        # 완성 병합본 CSV로 대체
-        return pd.read_csv(fallback)
-
-    rows = []
-    for line in lines:
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        try:
-            year = int(parts[0])
-            month = int(parts[1])
-            val = float(parts[3])  # average column
-        except Exception:
-            continue
-        rows.append([year, month, val])
-    co2_df = pd.DataFrame(rows, columns=["year", "month", "co2_ppm"])
-    co2_df = co2_df.groupby("year", as_index=False)["co2_ppm"].mean().rename(columns={"year": "Year"})
-
-    # 2) GISTEMP
-    lines = safe_fetch_lines(temp_url, fallback_path=fallback)
-    if lines is None:
-        return pd.read_csv(fallback)
-
-    header_idx = next(i for i, line in enumerate(lines) if line.strip().startswith("Year"))
-    temp_df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
-    target_col = "J-D" if "J-D" in temp_df.columns else temp_df.columns[1]
-    temp_df = temp_df[["Year", target_col]].rename(columns={target_col: "TempAnomaly"})
-    temp_df["TempAnomaly"] = pd.to_numeric(temp_df["TempAnomaly"], errors="coerce")
-    # 센티-섭씨 스케일이면 ℃로 변경
-    if temp_df["TempAnomaly"].abs().median() > 5:
-        temp_df["TempAnomaly"] = temp_df["TempAnomaly"] / 100.0
-    temp_df = temp_df.dropna()
-
-    merged = pd.merge(co2_df, temp_df, on="Year", how="inner").sort_values("Year").reset_index(drop=True)
-    return merged
-
-# -----------------------------
-# 데이터 로드
-# -----------------------------
-with st.spinner("데이터 로딩 중... 잠시만 기다려 주세요! 🚀"):
-    try:
-        df = load_datasets()
-    except Exception as e:
-        st.error(f"데이터를 불러오는 중 문제가 발생했습니다: {e}")
-        st.stop()
-
-# df 컬럼 가드
-required_cols = {"Year", "co2_ppm", "TempAnomaly"}
-if not required_cols.issubset(df.columns):
-    st.error(f"필수 컬럼 누락: {required_cols - set(df.columns)}")
-    st.stop()
-
-# -----------------------------
-# UI: 기간 선택
-# -----------------------------
-yr_min = int(df["Year"].min())
-yr_max = int(df["Year"].max())
-
-st.sidebar.header("연도 범위 선택")
-yr_start, yr_end = st.sidebar.slider(
-    "보고 싶은 기간을 골라보세요!",
-    min_value=yr_min, max_value=yr_max,
-    value=(max(1960, yr_min), yr_max), step=1
-)
-smooth = st.sidebar.checkbox("12년 이동평균 (전체적인 흐름 보기)", value=True)
-
-df_r = df[(df["Year"] >= yr_start) & (df["Year"] <= yr_end)].copy()
-if df_r.empty or len(df_r) < 2:
-    st.warning("선택한 연도 범위에 데이터가 부족합니다. 범위를 넓혀 보세요.")
-    st.stop()
-
-if smooth and len(df_r) >= 12:
-    df_r["co2_ppm_smooth"] = df_r["co2_ppm"].rolling(12, center=True, min_periods=1).mean()
-    df_r["TempAnomaly_smooth"] = df_r["TempAnomaly"].rolling(12, center=True, min_periods=1).mean()
-
-st.caption(
-    f"적용 연도 범위: {int(df_r['Year'].min())}–{int(df_r['Year'].max())} "
-    f"(전체 데이터 최신 연도: {int(df['Year'].max())})"
-)
-
-# -----------------------------
-# 시각화
-# -----------------------------
-st.subheader("📈 CO₂ 농도와 지구 평균 기온, 같이 볼까요?")
-sns.set_theme(style="whitegrid")
-fig, ax1 = plt.subplots(figsize=(10.5, 5.2))
-
-# CO₂ (좌축)
-ax1.plot(df_r["Year"], df_r["co2_ppm"], lw=1.6, color="#1f77b4", alpha=0.45, label="CO₂ 농도 (연평균)")
-if smooth and "co2_ppm_smooth" in df_r.columns:
-    ax1.plot(df_r["Year"], df_r["co2_ppm_smooth"], lw=2.8, color="#1f77b4", label="CO₂ 농도 (장기 추세)")
-ax1.set_xlabel("연도", fontproperties=font_prop)
-ax1.set_ylabel("대기 중 CO₂ (ppm)", color="#1f77b4", fontproperties=font_prop)
-ax1.tick_params(axis="y", labelcolor="#1f77b4")
-
-# 기온 이상치 (우축)
-ax2 = ax1.twinx()
-ax2.plot(df_r["Year"], df_r["TempAnomaly"], lw=1.6, color="#d62728", alpha=0.45, label="기온 변화 (연평균)")
-if smooth and "TempAnomaly_smooth" in df_r.columns:
-    ax2.plot(df_r["Year"], df_r["TempAnomaly_smooth"], lw=2.8, color="#d62728", label="기온 변화 (장기 추세)")
-ax2.set_ylabel("지구 평균 기온 변화 (℃)", color="#d62728", fontproperties=font_prop)
-ax2.tick_params(axis="y", labelcolor="#d62728")
-
-plt.title(f"CO₂ 농도와 지구 평균 기온 변화 ({yr_start}–{yr_end})", pad=10, fontproperties=font_prop)
-
-# 범례 통합
-lines1, labels1 = ax1.get_legend_handles_labels()
-lines2, labels2 = ax2.get_legend_handles_labels()
-ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper left", frameon=False, prop=font_prop)
-
-fig.tight_layout()
-st.pyplot(fig, clear_figure=True)
-
-# -----------------------------
-# 요약 지표
-# -----------------------------
-c1, c2, c3 = st.columns(3)
-c1.metric("CO₂ 얼마나 늘었을까?", f"{df_r['co2_ppm'].iloc[-1] - df_r['co2_ppm'].iloc[0]:+.1f} ppm")
-c2.metric("기온은 얼마나 변했을까?", f"{df_r['TempAnomaly'].iloc[-1] - df_r['TempAnomaly'].iloc[0]:+.2f} ℃")
-c3.metric("얼마나 관련 있을까? (상관계수)", f"{np.corrcoef(df_r['co2_ppm'], df_r['TempAnomaly'])[0,1]:.2f}")
-
-with st.expander("데이터 표로 확인하기"):
-    st.dataframe(
-        df_r[["Year", "co2_ppm", "TempAnomaly"]]
-          .rename(columns={"Year": "연도", "co2_ppm": "CO₂(ppm)", "TempAnomaly": "기온 변화(℃)"}),
-        use_container_width=True
-    )
-
-# 병합 데이터 다운로드 (현재 구간)
-csv_bytes = df_r.to_csv(index=False).encode("utf-8-sig")
-st.download_button(
-    "📥 분석용 CSV 내려받기 (현재 구간 병합본)",
-    data=csv_bytes,
-    file_name=f"co2_temp_merged_{yr_start}_{yr_end}.csv",
-    mime="text/csv"
-)
-
-# -----------------------------
-# 📘 데이터 해석 (모둠 관점)
-# -----------------------------
-st.markdown("---")
-st.header("📘 데이터 탐구 보고서: 우리 모둠의 발견")
-
-st.subheader("1. 대기 중 CO₂ 농도의 지속적인 증가")
-st.markdown("""
-그래프의 파란색 선(CO₂ 농도)을 보면 알 수 있듯이, CO₂ 농도가 지속적으로 상승하는 모습은 저희 모둠에게 상당히 인상적이었습니다. 
-저희가 태어나기 전인 1960년대 약 320ppm에서 현재 420ppm을 초과하는 수치에 도달한 것을 확인했습니다. 
-이는 단순히 숫자의 변화를 넘어, 인류의 활동이 지구 대기 환경 전체에 영향을 미치고 있다는 명확한 증거라고 생각되어 책임감을 느끼게 되었습니다.
-""")
-
-st.subheader("2. '기온 이상치' 상승의 의미")
-st.markdown("""
-빨간색 선(기온 변화)으로 표시된 '기온 이상치'는 특정 기준값과의 차이를 의미합니다. NASA에서는 **1951년부터 1980년까지의 30년 평균 기온**을 그 기준으로 사용합니다. 
-즉, 그래프의 0℃ 선이 바로 이 기간의 평균 기온이며, 각 연도의 값은 이 기준보다 얼마나 기온이 높았는지(플러스 값) 또는 낮았는지(마이너스 값)를 보여주는 것입니다.
-
-분석 결과, 최근에는 기준치보다 매년 0.5℃ 이상 높았으며, 근래에는 1℃를 초과하는 해도 관측되었습니다. 
-1℃라는 수치가 작게 느껴질 수 있지만, 이것이 전 지구적인 폭염, 폭우 등 극단적 기상 현상의 원인이 된다는 사실을 배우며 문제의 심각성을 체감할 수 있었습니다.
-""")
-
-st.subheader("3. CO₂ 농도와 기온 변화의 뚜렷한 상관관계")
-st.markdown("""
-이번 탐구에서 가장 주목할 만한 점은 **파란색 CO₂ 농도 선과 빨간색 기온 변화 선이** 매우 유사한 형태로 함께 상승한다는 사실이었습니다. 
-CO₂ 농도가 증가함에 따라 기온 역시 상승하는 뚜렷한 경향성을 발견했습니다. 
-이는 과학 시간에 배운 온실효과를 데이터로 직접 확인하는 과정이었으며, 눈에 보이지 않는 기체가 지구 전체의 온도를 높여 우리 삶에 직접적인 영향을 미칠 수 있다는 사실을 실감하게 했습니다.
-""")
-
-st.subheader("4. 탐구를 통해 느낀 점")
-st.markdown("""
-이번 프로젝트는 단순한 과제를 넘어, 데이터를 통해 미래 사회의 문제를 읽어내는 의미 있는 경험이었습니다. 
-기후 위기가 막연한 미래의 일이 아닌, 우리가 살고 있는 현재의 문제임을 데이터를 통해 명확히 인식하게 되었습니다. 
-이에 저희 모둠은 앞으로 교실 소등, 분리배출과 같은 일상 속 작은 실천부터 책임감을 갖고 행동하기로 다짐했습니다.
-""")
-
-# -----------------------------
-# 📢 우리 세대를 위한 제언
-# -----------------------------
-st.markdown("---")
-st.header("📢 우리 세대를 위한 제언")
-
-st.markdown("""
-저희는 이번 프로젝트를 통해 기후 위기가 교과서 속 지식이 아닌, 우리 모두의 현실임을 확인했습니다. 
-따라서 같은 시대를 살아가는 학생들에게 다음과 같이 제안하고자 합니다.
-""")
-
-st.markdown("""
-**1. 작은 실천의 중요성** 일상 속에서 무심코 사용하는 에너지를 절약하고, 급식 잔반을 남기지 않고, 일회용품 사용을 줄이는 등의 작은 습관이 모여 큰 변화를 만들 수 있습니다.
-
-**2. 데이터 기반의 소통** "지구가 아프다"는 감성적인 호소와 더불어, 객관적인 데이터를 근거로 토론하고 소통할 때 더 큰 설득력을 가질 수 있습니다.
-
-**3. 학교 공동체 내에서의 활동** 환경 동아리 활동이나 학급 캠페인을 통해 기후 위기 문제에 대한 공감대를 형성하고, 학교 차원의 해결 방안을 함께 고민해 볼 수 있습니다.
-
-**4. 미래 진로와의 연계** 기후 위기 문제를 해결하기 위한 과학 기술, 사회 정책 등 관련 분야로의 진로를 탐색하는 것은 우리 세대가 미래를 준비하는 또 다른 방법이 될 것입니다.
-
-기후 위기는 거대하고 어려운 문제이지만, 데이터를 통해 현상을 정확히 이해하고 함께 행동한다면 충분히 해결해 나갈 수 있습니다. 
-우리 세대의 관심과 실천이 지속 가능한 미래를 만드는 첫걸음이 될 것이라고 믿습니다. 🌱
-""")
-
-# -----------------------------
-# 📚 참고자료
-# -----------------------------
-st.markdown("---")
-st.header("📚 참고자료")
-
-st.markdown("""
-- **데이터 출처**
-    - [NOAA Global Monitoring Laboratory - Mauna Loa CO₂ Data](https://gml.noaa.gov/ccgg/trends/data.html)
-    - [NASA GISS Surface Temperature Analysis (GISTEMP v4)](https://data.giss.nasa.gov/gistemp/)
-- **추천 도서**
-    - 그레타 툰베리, 《기후 책》, 이순희 역, 기후변화행동연구소 감수, 열린책들, 2023. 
-      ([Yes24 도서 정보 링크](https://www.yes24.com/product/goods/119700330))
-""")
-
-# -----------------------------
-# Footer (팀명)
-# -----------------------------
-st.markdown(
+# --- 유틸리티 함수: HTTP 요청 재시도 및 예시 데이터 fallback ---
+def fetch_csv_with_retry(url: str, max_retries: int = 3, timeout: int = 15) -> Tuple[pd.DataFrame, str]:
     """
-    <div style='text-align: center; padding: 20px; color: gray; font-size: 0.9em;'>
-        미림마이스터고 1학년 4반 2조 · 지구야아프지말아조
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    주어진 URL에서 CSV를 시도해서 불러옴.
+    실패 시 빈 DataFrame과 오류 메시지 반환.
+    """
+    last_err = ""
+    for attempt in range(1, max_retries+1):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            content = resp.content.decode('utf-8', errors='replace')
+            df = pd.read_csv(io.StringIO(content))
+            return df, ""
+        except Exception as e:
+            last_err = f"Attempt {attempt} failed: {e}"
+            time.sleep(1)
+    return pd.DataFrame(), f"모든 시도 실패: {last_err}"
+
+@st.cache_data(show_spinner=False)
+def load_owid_co2() -> Tuple[pd.DataFrame, str]:
+    url = "https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv"
+    df, err = fetch_csv_with_retry(url)
+    if df.empty:
+        # 예시 데이터로 대체 (한국 CO2 간단 예시)
+        years = list(range(2000, 2024))
+        values = [570 + (i-2000)*3 + (np.random.rand()-0.4)*10 for i in range(len(years))]  # MtCO2 대충
+        df = pd.DataFrame({
+            "iso_code": ["KOR"] * len(years),
+            "country": ["South Korea"] * len(years),
+            "year": years,
+            "co2": values
+        })
+        err = "OWID 데이터 로드 실패 — 예시 데이터로 대체됨."
+    return df, err
+
+@st.cache_data(show_spinner=False)
+def load_gistemp_global() -> Tuple[pd.DataFrame, str]:
+    """
+    NASA GISTEMP provides a table CSV; we'll attempt to parse annual global mean (구조가 특이할 수 있음).
+    raw URL: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
+    """
+    url = "https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"
+    df, err = fetch_csv_with_retry(url)
+    if df.empty:
+        # 예시 글로벌 온도 이상치(연평균 이상온도) 예시
+        years = list(range(2000, 2024))
+        anomalies = [0.4 + 0.02*(y-2000) + (np.random.rand()-0.5)*0.05 for y in range(len(years))]
+        df = pd.DataFrame({"Year": years, "Annual": anomalies})
+        err = "GISTEMP 데이터 로드 실패 — 예시 데이터로 대체됨."
+        return df, err
+
+    # GISTEMP CSV 포맷: 첫 열 'Year', 마지막 열 'J-D' or 'Annual' 등. 파싱을 유연하게.
+    try:
+        # 파일에 헤더 주석이 있는 경우 첫 숫자행을 찾음
+        # 판다스로 읽었을 때 year-like 칼럼 찾아 처리
+        # 이미 df is a DataFrame; ensure Year and Annual columns exist.
+        if "Year" in df.columns and ("J-D" in df.columns or "Annual" in df.columns):
+            col = "Annual" if "Annual" in df.columns else "J-D"
+            out = df[["Year", col]].rename(columns={col: "Annual"})
+            out = out.dropna(subset=["Annual"])
+            out['Annual'] = pd.to_numeric(out['Annual'], errors='coerce')
+            out = out[out['Year'].apply(lambda x: str(x).isdigit())]
+            out['Year'] = out['Year'].astype(int)
+            return out, ""
+        else:
+            # 경우에 따라 df의 첫열이 Year로 잘 들어가지 않음 -> 시도 변환
+            first_col = df.columns[0]
+            # drop non-numeric rows:
+            df2 = df[df[first_col].astype(str).str.match(r'^\d{4}$')]
+            if df2.shape[0] > 0:
+                # pick a sensible annual column (last numeric)
+                numeric_cols = [c for c in df2.columns if df2[c].astype(str).str.replace('.','',1).str.isnumeric().all()]
+                if len(numeric_cols) >= 2:
+                    year_col = numeric_cols[0]
+                    annual_col = numeric_cols[-1]
+                    out = df2[[year_col, annual_col]]
+                    out.columns = ["Year", "Annual"]
+                    out['Year'] = out['Year'].astype(int)
+                    out['Annual'] = pd.to_numeric(out['Annual'], errors='coerce')
+                    return out, ""
+    except Exception as e:
+        return pd.DataFrame(), f"GISTEMP 파싱 중 오류: {e}"
+
+    return pd.DataFrame(), "GISTEMP 포맷이 예상과 다름 — 파싱 실패"
+
+# --- 데이터 불러오기 ---
+owid_df, owid_err = load_owid_co2()
+gistemp_df, gistemp_err = load_gistemp_global()
+
+# 공공 데이터 전처리 (한국 필터링)
+def prepare_korea_co2(df: pd.DataFrame) -> pd.DataFrame:
+    """OWID에서 South Korea만 추출하고 표준화 (date,value)."""
+    if df.empty:
+        return pd.DataFrame()
+    df_kor = df[df['country'].str.contains("Korea", case=False, na=False) | (df.get('iso_code') == 'KOR')].copy()
+    if 'year' in df_kor.columns:
+        df_kor = df_kor[['year', 'co2']].rename(columns={'year': 'date', 'co2': 'value'})
+    elif 'Year' in df_kor.columns:
+        df_kor = df_kor[['Year', 'co2']].rename(columns={'Year': 'date', 'co2': 'value'})
+    else:
+        # fallback: try to find year-like column and co2-like column
+        possible_year = next((c for c in df_kor.columns if 'year' in c.lower() or c.lower().strip() == 'year'), None)
+        possible_co2 = next((c for c in df_kor.columns if 'co2' in c.lower()), None)
+        if possible_year and possible_co2:
+            df_kor = df_kor[[possible_year, possible_co2]].rename(columns={possible_year: 'date', possible_co2: 'value'})
+        else:
+            return pd.DataFrame()
+    df_kor['date'] = pd.to_numeric(df_kor['date'], errors='coerce')
+    df_kor['value'] = pd.to_numeric(df_kor['value'], errors='coerce')
+    df_kor = df_kor.dropna(subset=['date'])
+    # 미래 데이터 제거 (오늘 자정 이후 데이터는 제거)
+    current_year = datetime.now().year
+    df_kor = df_kor[df_kor['date'] <= current_year]
+    df_kor = df_kor.sort_values('date').drop_duplicates(subset=['date'])
+    return df_kor
+
+def prepare_global_temp(df: pd.DataFrame) -> pd.DataFrame:
+    """GISTEMP에서 연평균 이상온도(Annual) 추출하여 표준화"""
+    if df.empty:
+        return pd.DataFrame()
+    if 'Year' in df.columns:
+        out = df[['Year', 'Annual']].rename(columns={'Year': 'date', 'Annual': 'value'})
+        out['date'] = pd.to_numeric(out['date'], errors='coerce')
+        out['value'] = pd.to_numeric(out['value'], errors='coerce')
+        out = out.dropna(subset=['date'])
+        current_year = datetime.now().year
+        out = out[out['date'] <= current_year]
+        out = out.sort_values('date').drop_duplicates(subset=['date'])
+        return out
+    # fallback: try to find numeric year col
+    return pd.DataFrame()
+
+korea_co2 = prepare_korea_co2(owid_df)
+global_temp = prepare_global_temp(gistemp_df)
+
+# --- 레이아웃: 사이드바 및 섹션 선택 ---
+st.sidebar.title("대시보드 옵션")
+section = st.sidebar.radio("섹션 선택", ["공개 데이터 대시보드", "사용자 입력(프롬프트) 대시보드", "원본 데이터 다운로드"])
+
+st.title("기후 데이터 대시보드 🌍")
+st.markdown("**설명:** 공개 데이터(OWID CO₂, NASA GISTEMP)를 우선 로드하고, 사용자가 제공한 프롬프트 텍스트와 이미지로 별도 분석을 생성합니다. 모든 라벨과 안내는 한국어입니다.")
+
+# 공공 데이터 섹션
+if section == "공개 데이터 대시보드":
+    st.header("공개 데이터 대시보드")
+    col1, col2 = st.columns([2,1])
+
+    with col1:
+        st.subheader("한국 연간 CO₂ 배출량 (Our World in Data)")
+        if owid_err:
+            st.warning("공개 데이터(OWID CO2) 로드 중 오류가 발생했습니다. 메시지: " + owid_err)
+        if korea_co2.empty:
+            st.error("한국 CO₂ 데이터가 준비되지 않았습니다. (대체 예시 사용 여부 확인)")
+        else:
+            fig = px.line(korea_co2, x='date', y='value', markers=True,
+                          labels={'date': '연도', 'value': 'CO₂ 배출량 (톤)'},
+                          title="대한민국 연간 CO₂ 배출량 추이 (OWID)")
+            fig.update_layout(xaxis=dict(dtick=1))
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("**설명:** 데이터 출처: Our World in Data (owid-co2-data).")
+        st.markdown("코드 주석에 원본 URL이 포함되어 있습니다.")
+
+    with col2:
+        st.subheader("글로벌 연평균 기온 이상치 (NASA GISTEMP)")
+        if gistemp_err:
+            st.warning("GISTEMP 데이터 로드/파싱 오류: " + gistemp_err)
+        if global_temp.empty:
+            st.error("GISTEMP 연평균 온도 데이터가 준비되지 않았습니다.")
+        else:
+            fig2 = px.line(global_temp, x='date', y='value', labels={'date':'연도','value':'연평균 이상온도 (℃)'},
+                           title="전지구 연평균 온도 이상치 (GISTEMP)")
+            st.plotly_chart(fig2, use_container_width=True)
+
+        st.markdown("**참고:** 이상온도는 기준 기간 대비 차이(Anomaly)입니다. 출처: NASA GISTEMP.")
+
+    st.markdown("---")
+    st.subheader("간단 인사이트 요약")
+    if not korea_co2.empty:
+        recent = korea_co2.tail(3)
+        st.write("최근 연도 데이터 (예시):")
+        st.table(recent)
+        change = korea_co2.iloc[-1]['value'] - korea_co2.iloc[0]['value']
+        st.write(f"기간: {int(korea_co2['date'].min())} - {int(korea_co2['date'].max())} | 총 변화량: {change:.1f} (단위: CO₂)")
+    else:
+        st.write("한국 CO₂ 데이터가 없어 인사이트를 생성할 수 없습니다.")
+
+# 사용자 입력(프롬프트) 섹션
+if section == "사용자 입력(프롬프트) 대시보드":
+    st.header("사용자 입력 기반 대시보드")
+    st.markdown("프롬프트에서 제공된 설명을 바탕으로 '지난 20년간 한국 평균기온 상승'과 '폭염일수 증가'를 가상/재구성하여 시각화합니다.")
+    st.markdown("앱 실행 중 파일 업로드를 요구하지 않으며, 대화에서 제공된 이미지가 자동으로 사용됩니다.")
+
+    # 이미지 표시: 컨테이너에 업로드된 이미지 파일 사용 (개발자가 지정)
+    try:
+        img1 = "/mnt/data/스크린샷 2025-09-16 오전 11.10.59.png"
+        img2 = "/mnt/data/국어 시각화 자료_지구가열.png"
+        img3 = "/mnt/data/스크린샷 2025-09-16 오전 11.12.48.png"
+        st.image([img1, img2, img3], caption=["온실가스·GDP 테이블 스냅샷", "지구가열 시각화", "온실가스 배출량 시계열"], use_column_width=True)
+    except Exception:
+        st.info("제공된 이미지가 없습니다 또는 경로를 찾을 수 없습니다. (개발자 경로 사용 중)")
+
+    # 프롬프트 텍스트 기반 데이터 생성 (입력 섹션의 내용 활용)
+    st.subheader("프롬프트 기반 재구성 데이터 (예시)")
+    st.markdown("프롬프트에서 '지난 20년간 평균기온 약 +1.4℃ 상승', '폭염일수 1.5배 증가' 등의 기술을 기반으로 예시 데이터를 생성합니다.")
+
+    # 생성: 2003-2022 (지난 20년)
+    years = np.arange(2003, 2023)
+    # avg temp baseline (2003): 가정 12.0 -> 2022에는 +1.4
+    temps = 12.0 + (1.4 / (len(years)-1)) * (years - years[0]) + np.random.normal(0, 0.05, len(years))
+    # 폭염일수: baseline 5일 -> 1.5배 증가 over period
+    heatdays = 5.0 * (1 + (0.5/(len(years)-1)) * (years - years[0])) + np.random.poisson(1, len(years))*0.2
+
+    user_df = pd.DataFrame({"연도": years, "평균기온(℃)": np.round(temps, 2), "폭염일수(일)": np.round(heatdays,1)})
+
+    # 시각화: 온도 추세 (라인) + 폭염일수 (막대)
+    fig = px.line(user_df, x='연도', y='평균기온(℃)', markers=True, title="(프롬프트 재구성) 지난 20년간 평균기온 추이")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig2 = px.bar(user_df, x='연도', y='폭염일수(일)', title="(프롬프트 재구성) 지난 20년간 폭염일수 변화")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    # 간단 통계
+    st.subheader("요약 통계 (프롬프트 기반 데이터)")
+    st.write(user_df.describe())
+
+    # CSV 다운로드 버튼 (전처리된 표로 내보내기)
+    csv_buffer = io.StringIO()
+    user_df.to_csv(csv_buffer, index=False)
+    st.download_button("프롬프트 기반 전처리 데이터 다운로드 (CSV)", csv_buffer.getvalue(), file_name="prompt_reconstruction_20yrs.csv", mime="text/csv")
+
+    st.markdown("**제언(교육용 메시지 예시):** 기후변화는 이미 현실입니다. 청소년 대상 에너지 절약 챌린지(연간 전력 10% 절감 등)는 개인 단위로도 연간 CO₂ 절감(약 120~150kg) 효과를 냅니다. 데이터 기반 행동 목표를 세우세요.")
+
+# 원본 데이터 다운로드 섹션
+if section == "원본 데이터 다운로드":
+    st.header("원본/전처리 데이터 다운로드")
+    st.markdown("공개 데이터(OWID, GISTEMP) 및 프롬프트 기반 재구성 데이터의 전처리된 표를 CSV로 다운로드할 수 있습니다.")
+
+    if not korea_co2.empty:
+        buf = io.StringIO()
+        korea_co2.to_csv(buf, index=False)
+        st.download_button("한국 CO₂ (OWID) 전처리 CSV 다운로드", buf.getvalue(), file_name="korea_co2_owid_preprocessed.csv", mime="text/csv")
+
+    if not global_temp.empty:
+        buf2 = io.StringIO()
+        global_temp.to_csv(buf2, index=False)
+        st.download_button("Global Temp (GISTEMP) 전처리 CSV 다운로드", buf2.getvalue(), file_name="global_temp_gistemp_preprocessed.csv", mime="text/csv")
+
+    # 프롬프트 데이터
+    buf3 = io.StringIO()
+    user_df.to_csv(buf3, index=False)
+    st.download_button("프롬프트 재구성 데이터 CSV 다운로드", buf3.getvalue(), file_name="prompt_reconstruction_20yrs.csv", mime="text/csv")
+
+st.markdown("---")
+st.markdown("**참고/주의:**")
+st.markdown("- 공개 데이터 로드 실패 시 예시 데이터를 자동 생성하여 보여줍니다. 상단 알림을 확인하세요.")
+st.markdown("- 본 앱은 교육/시연 목적의 대시보드 템플릿이며, 실제 연구/정책 결정에는 원본 데이터를 직접 확인하세요.")
+st.markdown("- 출처: OWID(owid-co2-data), NASA GISTEMP, KMA(Open MET) 등. (코드 상단 주석 참조)")
